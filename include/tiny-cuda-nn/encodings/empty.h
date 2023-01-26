@@ -22,9 +22,10 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-/** @file   identity.h
+/** @file   empty.h
  *  @author Thomas Müller, NVIDIA
- *  @brief  Implementation of the identity encoding (output == input).
+ *  @brief  Implementation of an encoding that swallows its inputs without
+ *          producing any outputs.
  */
 
 #pragma once
@@ -43,35 +44,9 @@
 TCNN_NAMESPACE_BEGIN
 
 template <typename T>
-__global__ void identity(
-	const uint32_t num_outputs,
-	const uint32_t num_to_encode,
-	const uint32_t num_to_pad,
-	const float scale,
-	const float offset,
-	MatrixView<const float> data_in,
-	MatrixView<T> data_out)
-{
-	const uint32_t encoded_index = threadIdx.x + blockIdx.x * blockDim.x;
-	if (encoded_index >= num_outputs) return;
-
-	const uint32_t fan_out = num_to_encode + num_to_pad;
-	const uint32_t i = encoded_index / fan_out;
-	const uint32_t j = encoded_index - i * fan_out;
-
-	if (j >= num_to_encode) {
-		data_out(j, i) = 1;
-	} else {
-		data_out(j, i) = data_in(j, i) * scale + offset;
-	}
-}
-
-template <typename T>
-__global__ void identity_backward(
+__global__ void empty_backward(
 	const uint32_t num_outputs,
 	const uint32_t n_dims_to_encode,
-	const float scale,
-	MatrixView<const T> dL_dy,
 	MatrixView<float> dL_dx)
 {
 	const uint32_t output_index = threadIdx.x + blockIdx.x * blockDim.x;
@@ -80,17 +55,14 @@ __global__ void identity_backward(
 	const uint32_t i = output_index / n_dims_to_encode;
 	const uint32_t j = output_index - i * n_dims_to_encode;
 
-	// The identity encoding can simply pass through the derivative.
-	dL_dx(j, i) = (T)((float)dL_dy(j, i) * scale);
+	dL_dx(j, i) = 0;
 }
 
 template <typename T>
-class IdentityEncoding : public Encoding<T> {
+class EmptyEncoding : public Encoding<T> {
 public:
-	IdentityEncoding(uint32_t n_dims_to_encode, float scale = 1.0f, float offset = 0.0f)
-	: m_n_dims_to_encode{n_dims_to_encode}, m_scale{scale}, m_offset{offset} {
-		m_n_output_dims = m_n_dims_to_encode;
-	}
+	EmptyEncoding(uint32_t n_dims_to_encode)
+	: m_n_dims_to_encode{n_dims_to_encode} {}
 
 	std::unique_ptr<Context> forward_impl(
 		cudaStream_t stream,
@@ -99,19 +71,20 @@ public:
 		bool use_inference_params = false,
 		bool prepare_input_gradients = false
 	) override {
-		if (!output || padded_output_width() == 0) {
+		const uint32_t num_elements = input.n();
+		if (!output || padded_output_width() == 0 || num_elements == 0) {
 			return std::make_unique<Context>();
 		}
 
-		linear_kernel(identity<T>, 0, stream,
-			input.n() * padded_output_width(),
-			m_n_dims_to_encode,
-			m_n_to_pad,
-			m_scale,
-			m_offset,
-			input.view(),
-			output->view()
-		);
+		if (output->layout() == AoS) {
+			parallel_for_gpu_aos(stream, num_elements, m_n_to_pad, [out=output->pitched_ptr()] __device__ (size_t elem, size_t dim) {
+				out(elem)[dim] = (T)1.0f;
+			});
+		} else {
+			parallel_for_gpu(stream, num_elements * m_n_to_pad, [out=output->data()] __device__ (size_t i) {
+				out[i] = (T)1.0f;
+			});
+		}
 
 		return std::make_unique<Context>();
 	}
@@ -130,11 +103,9 @@ public:
 			return;
 		}
 
-		linear_kernel(identity_backward<T>, 0, stream,
+		linear_kernel(empty_backward<T>, 0, stream,
 			input.n() * m_n_dims_to_encode,
 			m_n_dims_to_encode,
-			m_scale,
-			dL_doutput.view(),
 			dL_dinput->view()
 		);
 	}
@@ -144,7 +115,7 @@ public:
 	}
 
 	uint32_t padded_output_width() const override {
-		return m_n_output_dims + m_n_to_pad;
+		return m_n_to_pad;
 	}
 
 	uint32_t output_width() const override {
@@ -156,8 +127,7 @@ public:
 	}
 
 	void set_padded_output_width(uint32_t padded_output_width) override {
-		CHECK_THROW(padded_output_width >= m_n_output_dims);
-		m_n_to_pad = padded_output_width - m_n_output_dims;
+		m_n_to_pad = padded_output_width;
 	}
 
 	uint32_t required_output_alignment() const override {
@@ -170,20 +140,12 @@ public:
 
 	json hyperparams() const override {
 		return {
-			{"otype", "Identity"},
-			{"scale", m_scale},
-			{"offset", m_offset},
+			{"otype", "Empty"},
 		};
 	}
 
 private:
 	uint32_t m_n_dims_to_encode;
-
-	float m_scale;
-	float m_offset;
-
-	// derived sizes
-	uint32_t m_n_output_dims;
 	uint32_t m_n_to_pad = 0;
 };
 
